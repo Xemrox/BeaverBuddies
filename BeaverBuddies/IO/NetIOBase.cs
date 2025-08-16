@@ -35,16 +35,22 @@ namespace BeaverBuddies.IO
 
         private static ReplayEvent ToEvent(JObject obj)
         {
-            //Plugin.Log($"Recieving {obj}");
+            // Fast path for minimal heartbeat objects (custom short form {"type":"H","ticksSinceLoad":N})
+            var typeToken = obj["type"];
+            if (typeToken != null && typeToken.Type == JTokenType.String && typeToken.Value<string>() == "H")
+            {
+                // Minimal construction without JSON polymorphism
+                return new HeartbeatEvent() { ticksSinceLoad = obj[TimberNetBase.TICKS_KEY]?.Value<int>() ?? 0 };
+            }
             try
             {
-                return JsonSettings.Deserialize<ReplayEvent>(obj.ToString());
+                return NetworkEventSerializer.Deserialize(obj);
             }
             catch (Exception ex)
             {
                 Plugin.Log(ex.ToString());
+                return null;
             }
-            return null;
         }
 
         public List<ReplayEvent> ReadEvents(int ticksSinceLoad)
@@ -59,11 +65,61 @@ namespace BeaverBuddies.IO
         public virtual void WriteEvents(params ReplayEvent[] events)
         {
             if (NetBase == null) return;
-            foreach (ReplayEvent e in events)
+            // If only a single heartbeat, keep existing fast path.
+            if (events.Length == 1 && events[0] is HeartbeatEvent hbOnly)
             {
-                // TODO: It is silly to convert to JObject here, but not sure if there's
-                // a better way to do it.
-                NetBase.DoUserInitiatedEvent(JObject.Parse(JsonSettings.Serialize(e)));
+                var hb = new JObject
+                {
+                    [TimberNetBase.TICKS_KEY] = hbOnly.ticksSinceLoad,
+                    [TimberNetBase.TYPE_KEY] = "H"
+                };
+                NetBase.DoUserInitiatedEvent(hb);
+                return;
+            }
+            // If more than one event (or a single non-heartbeat), build a binary container.
+            List<JObject> serialized = new List<JObject>();
+            foreach (var e in events)
+            {
+                if (e is HeartbeatEvent hb)
+                {
+                    var obj = new JObject
+                    {
+                        [TimberNetBase.TICKS_KEY] = hb.ticksSinceLoad,
+                        [TimberNetBase.TYPE_KEY] = "H"
+                    };
+                    serialized.Add(obj);
+                }
+                else
+                {
+                    serialized.Add(NetworkEventSerializer.Serialize(e));
+                }
+            }
+            // Use underlying server/client socket(s). For client, NetBase is TimberClient (single socket).
+            // We call SendEventsContainerForTick once per target; for server we still rely on DoUserInitiatedEvent path to broadcast.
+            // Simpler: if server, fall back to existing per-event path (will broadcast), else container.
+            if (NetBase is TimberNet.TimberServer)
+            {
+                // Fallback: send individually (server broadcast logic lives there). Future: implement server-side container broadcast.
+                foreach (var obj in serialized)
+                {
+                    NetBase.DoUserInitiatedEvent(obj);
+                }
+            }
+            else
+            {
+                // Client: send as single binary container for this tick.
+                int tick = events.Last().ticksSinceLoad; // all set above
+                var client = NetBase as TimberNet.TimberClient;
+                if (client != null)
+                {
+                    client.SendEventsContainer(tick, serialized);
+                }
+                else
+                {
+                    // Fallback (should not happen): individual
+                    foreach (var obj in serialized)
+                        NetBase.DoUserInitiatedEvent(obj);
+                }
             }
         }
 

@@ -68,6 +68,13 @@ namespace BeaverBuddies.DesyncDetecter
 
         public static IEnumerable<ReplayEvent> CreateReplayEventsAndClear()
         {
+            // If not in debug mode, do not send trace events; just clear them.
+            if (!Settings.Debug)
+            {
+                traces.Clear();
+                traces.Add(new List<Trace>());
+                yield break;
+            }
             // The first tick is the current tick shifted by the number of traces - 1
             int tick = currentTick - (traces.Count - 1);
             while (traces.Count > 0)

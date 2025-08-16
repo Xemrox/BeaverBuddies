@@ -32,6 +32,12 @@ namespace TimberNet
             SendEvent(client, message);
         }
 
+    // Expose container sending for higher-level IO (client side batching)
+    public void SendEventsContainer(int tick, List<JObject> events)
+        {
+            SendEventsContainerForTick(client, tick, events);
+        }
+
         protected override void ProcessReceivedEvent(JObject message)
         {
             base.ProcessReceivedEvent(message);

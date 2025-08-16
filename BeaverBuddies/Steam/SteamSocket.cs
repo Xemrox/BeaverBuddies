@@ -24,7 +24,7 @@ namespace BeaverBuddies.Steam
         //public readonly CSteamID lobbyID;
 
         private readonly ConcurrentQueueWithWait<byte[]> readBuffer = new ConcurrentQueueWithWait<byte[]>();
-        private int readOffset = 0;
+    // removed unused readOffset
 
         private SteamPacketListener packetListener;
 
@@ -57,24 +57,26 @@ namespace BeaverBuddies.Steam
             packetListener?.UnregisterSocket(this);
         }
 
+        private byte[] _currentRead = null;
+        private int _currentReadOffset = 0;
         public int Read(byte[] buffer, int offset, int count)
         {
-            // Block until we've read something
-            byte[] result;
-            while (!readBuffer.WaitAndTryDequeue(out result)) { }
-            int bytesToCopy = Math.Min(count, result.Length - readOffset);
-            Array.Copy(result, readOffset, buffer, offset, bytesToCopy);
-            if (result.Length > bytesToCopy)
+            // Ensure we have a current buffer with remaining bytes
+            while (_currentRead == null || _currentReadOffset >= _currentRead.Length)
             {
-                // This will fail we ever receive a packet that
-                // spans multiple messages. I don't think that can happen right
-                // now unless things get jumbled, but we should log a more useful
-                // warning. And right now  the "readOffset" should always be 0.
-                Plugin.LogWarning($"SteamSocket read {bytesToCopy} bytes, but {result.Length - bytesToCopy} bytes were left over. This is probably a bug!");
-                readOffset = bytesToCopy;
+                if (!readBuffer.WaitAndTryDequeue(out _currentRead)) continue; // block until data
+                _currentReadOffset = 0;
             }
-            //Plugin.Log($"SteamSocket receiving {bytesToCopy} bytes");
-
+            int remaining = _currentRead.Length - _currentReadOffset;
+            int bytesToCopy = Math.Min(count, remaining);
+            Array.Copy(_currentRead, _currentReadOffset, buffer, offset, bytesToCopy);
+            _currentReadOffset += bytesToCopy;
+            if (_currentReadOffset >= _currentRead.Length)
+            {
+                // Finished this packet
+                _currentRead = null;
+                _currentReadOffset = 0;
+            }
             return bytesToCopy;
         }
 

@@ -19,6 +19,9 @@ namespace TimberNet
         private readonly List<ISocketStream> clients = new List<ISocketStream>();
         private readonly ConcurrentDictionary<ISocketStream, ConcurrentQueue<JObject>> queuedMessages =
             new ConcurrentDictionary<ISocketStream, ConcurrentQueue<JObject>>();
+    // Pending per-client batched events (non-heartbeat) to send as container
+    private readonly Dictionary<ISocketStream, List<JObject>> _pendingContainers = new Dictionary<ISocketStream, List<JObject>>();
+    private readonly Dictionary<ISocketStream, int> _pendingContainerTick = new Dictionary<ISocketStream, int>();
 
         private readonly ISocketListener listener;
 
@@ -130,11 +133,7 @@ namespace TimberNet
                 if (queuedMessages.TryGetValue(client, out ConcurrentQueue<JObject> queue))
                 {
                     // Log($"Found {queue.Count} messages");
-                    while (queue.TryDequeue(out JObject message))
-                    {
-                        // Log(message.ToString());
-                        SendEvent(client, message);
-                    }
+                    FlushQueuedToClientAsContainers(client, queue);
                     queuedMessages.TryRemove(client, out _);
                 }
                 else
@@ -142,6 +141,59 @@ namespace TimberNet
                     Log("Warning! Missing client!");
                 }
             }
+        }
+
+        private bool IsHeartbeat(JObject msg) => msg[TYPE_KEY]?.ToString() == HEARTBEAT_EVENT || msg[TYPE_KEY]?.ToString() == "H";
+
+        private void FlushPendingContainer(ISocketStream client)
+        {
+            if (_pendingContainers.TryGetValue(client, out var list) && list.Count > 0)
+            {
+                int tick = _pendingContainerTick[client];
+                SendEventsContainerForTick(client, tick, list);
+                list.Clear();
+            }
+        }
+
+        private void AddToPending(ISocketStream client, JObject message)
+        {
+            int tick = message[TICKS_KEY]?.ToObject<int>() ?? 0;
+            if (!_pendingContainers.TryGetValue(client, out var list))
+            {
+                list = new List<JObject>();
+                _pendingContainers[client] = list;
+                _pendingContainerTick[client] = tick;
+            }
+            // If tick changes flush old list first
+            if (_pendingContainerTick[client] != tick)
+            {
+                FlushPendingContainer(client);
+                _pendingContainerTick[client] = tick;
+            }
+            list.Add(message);
+            // Heuristic: flush if list grows large (avoid latency)
+            if (list.Count >= 16)
+            {
+                FlushPendingContainer(client);
+            }
+        }
+
+        private void FlushQueuedToClientAsContainers(ISocketStream client, ConcurrentQueue<JObject> queue)
+        {
+            while (queue.TryDequeue(out JObject message))
+            {
+                if (IsHeartbeat(message))
+                {
+                    // Heartbeats go out immediately (small binary frame in base)
+                    FlushPendingContainer(client); // ensure ordering
+                    SendEvent(client, message);
+                }
+                else
+                {
+                    AddToPending(client, message);
+                }
+            }
+            FlushPendingContainer(client);
         }
 
         private void SendErrorMessage(ISocketStream client)
@@ -216,17 +268,40 @@ namespace TimberNet
             // setup to start or stop queueing
             lock (queuedMessages)
             {
-                clients.ForEach(client =>
+                foreach (var client in clients)
                 {
                     if (sendNow)
                     {
+                        // Flush pending before direct send to preserve order
+                        if (!IsHeartbeat(message)) FlushPendingContainer(client);
                         SendEvent(client, message);
                     }
                     else
                     {
-                        QueueOrSentToClient(client, message);
+                        if (queuedMessages.TryGetValue(client, out var q))
+                        {
+                            q.Enqueue(message);
+                        }
+                        else
+                        {
+                            // Not in queuing phase; treat as runtime broadcast - batch non-heartbeats
+                            if (IsHeartbeat(message))
+                            {
+                                FlushPendingContainer(client);
+                                SendEvent(client, message);
+                            }
+                            else
+                            {
+                                AddToPending(client, message);
+                            }
+                        }
                     }
-                });
+                }
+                // Optionally flush small batches at tick boundary: if heartbeat was just sent, flush previous non-heartbeats
+                if (IsHeartbeat(message))
+                {
+                    foreach (var client in clients) FlushPendingContainer(client);
+                }
             }
         }
 

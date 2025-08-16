@@ -2,10 +2,10 @@
 using HarmonyLib;
 using System;
 using System.Collections.Generic;
-using System.Text;
 using Timberborn.Options;
 using Timberborn.OptionsGame;
 using Timberborn.TimeSystem;
+using Timberborn.UILayoutSystem;
 using static BeaverBuddies.SingletonManager;
 
 namespace BeaverBuddies.Events
@@ -44,6 +44,7 @@ namespace BeaverBuddies.Events
     public class SpeedChangePatcher
     {
         private static bool silently = false;
+        private static System.Reflection.FieldInfo _isLockedField;
 
         public static void SetSpeedSilently(SpeedManager speedManager, float speed)
         {
@@ -54,6 +55,20 @@ namespace BeaverBuddies.Events
 
         static bool Prefix(SpeedManager __instance, ref float speed)
         {
+            // During replay (processing network events), ensure lock doesn't suppress speed changes
+            if (ReplayService.IsReplayingEvents)
+            {
+                if (_isLockedField == null)
+                {
+                    _isLockedField = typeof(SpeedManager).GetField("_isLocked", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+                }
+                if (_isLockedField != null)
+                {
+                    _isLockedField.SetValue(__instance, false);
+                }
+                // Don't record outgoing SpeedSetEvent for a replayed change.
+                return true;
+            }
             if (!ReplayService.IsLoaded) return true;
             // No need to log speed changes to current speed
             if (__instance.CurrentSpeed == speed) return true;
@@ -67,6 +82,12 @@ namespace BeaverBuddies.Events
             {
                 speed = speed
             });
+            // If we're a client (sending user events) and the game is paused (speed 0), ticks may not advance promptly.
+            // Flush immediately so host receives unpause request.
+            if (EventIO.Get()?.UserEventBehavior == UserEventBehavior.Send && __instance.CurrentSpeed == 0f && speed > 0f)
+            {
+                replayService.FlushRecordedEvents();
+            }
 
             if (EventIO.ShouldPlayPatchedEvents)
             {
@@ -79,8 +100,7 @@ namespace BeaverBuddies.Events
         }
     }
 
-    // TODO: It might be nice to make this configurable: whether the host
-    // should freeze the game for these pop-ups. If we don't freeze, it could
+    // This is now configurable via Settings.ReducePausesEnable. If we don't freeze, it could
     // definitely cause some possible invalid operations (e.g. deleting a building
     // that's not there anymore), but in theory these errors get caught before
     // sending to the server. In practice, though, there could be side-effects of
@@ -100,8 +120,15 @@ namespace BeaverBuddies.Events
     [HarmonyPatch(typeof(SpeedManager), nameof(SpeedManager.ChangeAndLockSpeed))]
     public class SpeedLockPatcher
     {
+        // When true, skip the next ChangeAndLockSpeed call (used by various UI events when ReducePauses is enabled)
+        public static bool SkipNextSpeedLock = false;
         static bool Prefix(SpeedManager __instance, float value)
         {
+            if (SkipNextSpeedLock)
+            {
+                SkipNextSpeedLock = false;
+                return false; // skip original; do not modify speed or lock
+            }
             // Clients should never freeze for dialogs. Main menu will be
             // handled separately.
             if (EventIO.Get()?.UserEventBehavior == UserEventBehavior.Send)
@@ -135,8 +162,8 @@ namespace BeaverBuddies.Events
     {
         static bool Prefix(SpeedManager __instance)
         {
-            // Clients should never unfreeze for dialogs. See above.
-            if (EventIO.Get()?.UserEventBehavior == UserEventBehavior.Send)
+            // Block manual client dialog unlocks, but allow during replay of network events.
+            if (EventIO.Get()?.UserEventBehavior == UserEventBehavior.Send && !ReplayService.IsReplayingEvents)
             {
                 return false;
             }
@@ -175,16 +202,40 @@ namespace BeaverBuddies.Events
     // However, only the host will be able to unpause, and only by manually
     // setting the game speed, since they won't process any events by clients
     // while they have a panel (including this one) up (I think...).
-    // TODO: Should allow client to bring up menu, even if they don't pause
     [HarmonyPatch(typeof(GameOptionsBox), nameof(GameOptionsBox.Show))]
     public class GameOptionsBoxShowPatcher
     {
         static bool Prefix()
         {
-            return ReplayEvent.DoPrefix(() =>
+            // If the user wants to reduce pauses, don't create an event or pause the game.
+            // Let each player open their own menu independently.
+            if (Settings.ReducePausesEnabled)
             {
-                return new ShowOptionsMenuEvent();
-            });
+                // Signal that the next lock attempt should be skipped
+                SpeedLockPatcher.SkipNextSpeedLock = true;
+                return true;
+            }
+
+            // Otherwise, treat showing options as a synced event that pauses.
+            return ReplayEvent.DoPrefix(() => new ShowOptionsMenuEvent());
+        }
+    }
+
+    // OverlayPanelSpeedLocker is triggering ChangeAndLockSpeed via OnPanelShown
+    // We suppress its locking behavior entirely when ReducePauses is enabled to avoid unintended pauses
+    // for overlay/submenus.
+    [HarmonyPatch(typeof(OverlayPanelSpeedLocker), "OnPanelShown")]
+    public class OverlayPanelSpeedLockerShowPatcher
+    {
+        static bool Prefix()
+        {
+            if (Settings.ReducePausesEnabled)
+            {
+                // Ensure that even if original would call ChangeAndLockSpeed, it gets skipped.
+                SpeedLockPatcher.SkipNextSpeedLock = true;
+                return false;
+            }
+            return true;
         }
     }
 }

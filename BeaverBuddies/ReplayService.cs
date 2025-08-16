@@ -57,11 +57,15 @@ namespace BeaverBuddies
      */
     class GroupedEvent : ReplayEvent
     {
+
         public List<ReplayEvent> events;
+
+        public GroupedEvent() {
+            events = new List<ReplayEvent>();
+        }
 
         public GroupedEvent(List<ReplayEvent> events)
         {
-            // Make a copy
             this.events = events.ToList();
         }
 
@@ -99,8 +103,8 @@ namespace BeaverBuddies
         private EventIO io => EventIO.Get();
 
         private int __ticksSinceLoad = 0;
-        private int ticksSinceLoad 
-        { 
+        private int ticksSinceLoad
+        {
             get => __ticksSinceLoad;
             set
             {
@@ -116,6 +120,41 @@ namespace BeaverBuddies
 
         private ConcurrentQueue<ReplayEvent> eventsToSend = new ConcurrentQueue<ReplayEvent>();
         private ConcurrentQueue<ReplayEvent> eventsToPlay = new ConcurrentQueue<ReplayEvent>();
+
+        // --- Event composition instrumentation (Option A) ---
+        private readonly Dictionary<string, int> _eventTypeWindowCounts = new Dictionary<string, int>();
+        private int _eventTypeWindowStartTick = 0;
+        private const int EventTypeWindowSize = 200; // matches net metrics default
+        private int _windowGroupedEvents = 0; // number of GroupedEvent packets sent in window
+        private int _windowInnerEvents = 0;   // total inner events aggregated
+    // Heartbeat throttling removed: need at least one message per tick for client tick advancement
+    // (Consider separate tick channel in future.)
+        private void RecordEventTypes(List<ReplayEvent> list)
+        {
+            foreach (var e in list)
+            {
+                string name = e.GetType().Name;
+                if (_eventTypeWindowCounts.TryGetValue(name, out int c)) _eventTypeWindowCounts[name] = c + 1; else _eventTypeWindowCounts[name] = 1;
+                _windowInnerEvents++;
+            }
+            _windowGroupedEvents++;
+            int tick = ticksSinceLoad; // current tick
+            if (tick - _eventTypeWindowStartTick >= EventTypeWindowSize)
+            {
+                LogEventTypeSummary(tick);
+                _eventTypeWindowCounts.Clear();
+                _windowGroupedEvents = 0;
+                _windowInnerEvents = 0;
+                _eventTypeWindowStartTick = tick;
+            }
+        }
+        private void LogEventTypeSummary(int tick)
+        {
+            if (_eventTypeWindowCounts.Count == 0) return;
+            var top = _eventTypeWindowCounts.OrderByDescending(kv => kv.Value).Take(8)
+                .Select(kv => kv.Key + ":" + kv.Value).ToList();
+            Plugin.Log($"EVENT COMPOSITION window={EventTypeWindowSize} ticks ending@{tick} grouped={_windowGroupedEvents} inner={_windowInnerEvents} unique={_eventTypeWindowCounts.Count} top=[{string.Join(", ", top)}]");
+        }
 
         /// <summary>
         /// Returns true if the ReplayService is ready for the game to
@@ -320,8 +359,8 @@ namespace BeaverBuddies
                     Plugin.LogWarning($"Event past time: {eventTime} < {currentTick}");
                 }
                 //Plugin.Log($"Replaying event [{replayEvent.ticksSinceLoad}]: {replayEvent.type}");
-                
-                // If this event was played (e.g. on the server) and recorded a 
+
+                // If this event was played (e.g. on the server) and recorded a
                 // random state, make sure we're in the same state.
                 // Skip if we're in Debug mode, since we'll get more details
                 // if we look at the full trace.
@@ -385,7 +424,7 @@ namespace BeaverBuddies
         /**
          * Readies and event for sending to connected players.
          * Adds the randomS0 if the event will be played, but assumed
-         * this is called *before* the event is played. If this is 
+         * this is called *before* the event is played. If this is
          * called after an event is played, the randomS0 should already
          * be set (it will not be overwritten).
          */
@@ -401,6 +440,7 @@ namespace BeaverBuddies
                 //Plugin.Log($"Recording event s0: {replayEvent.randomS0Before}");
             }
             eventsToSend.Enqueue(replayEvent);
+            // No longer tracking last non-heartbeat; every tick without other events will get a minimal heartbeat.
         }
 
         private void SendEvents()
@@ -414,9 +454,22 @@ namespace BeaverBuddies
             }
             // Don't send an empty list to save bandwidth.
             if (events.Count == 0) return;
-            GroupedEvent group = new GroupedEvent(events);
-            group.ticksSinceLoad = ticksSinceLoad;
-            EventIO.Get().WriteEvents(group);
+            // Fast path: if only a single heartbeat, still send directly.
+            if (events.Count == 1 && events[0] is HeartbeatEvent)
+            {
+                EventIO.Get().WriteEvents(events[0]);
+                return;
+            }
+            // Record composition of actual underlying events (no synthetic GroupedEvent wrapper anymore)
+            RecordEventTypes(events);
+            // Send each underlying event so network layer can batch them into a binary container.
+            EventIO.Get().WriteEvents(events.ToArray());
+        }
+
+        public void FlushRecordedEvents()
+        {
+            // Allow explicit immediate network flush (e.g., unpausing while game speed 0 so ticks not advancing yet)
+            SendEvents();
         }
 
         /**
@@ -528,10 +581,9 @@ namespace BeaverBuddies
 
             ticksSinceLoad++;
 
-            if (io.ShouldSendHeartbeat)
+            if (io.ShouldSendHeartbeat && eventsToSend.IsEmpty)
             {
-                // Add a heartbeat if needed to make sure all ticks have
-                // at least 1 event, so the clients know we're ticking.
+                // Ensure a tick marker so clients advance
                 EnqueueEventForSending(new HeartbeatEvent());
             }
             // Replay and send events at the change of a tick always.

@@ -66,8 +66,8 @@ namespace BeaverBuddies.IO
     {
         public JsonSettings()
         {
-            // TODO: Undo for production
-            Formatting = Formatting.Indented;
+            // Production: compact JSON (indentation wastes bandwidth; GZip helps but still costs CPU)
+            Formatting = Formatting.None;
             TypeNameHandling = TypeNameHandling.All;
             Converters.Add(new Vector3Converter());
             Converters.Add(new Vector3IntConverter());
